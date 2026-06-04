@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/cache"
 	"github.com/Wei-Shaw/sub2api/internal/guard"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
@@ -2718,6 +2719,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if c != nil && openAIConfuseState != nil {
 			c.Set("openai_guard_confuse_state", openAIConfuseState)
 		}
+		if c != nil && promptCacheKey != "" {
+			// Save the original (pre-confusion) prompt cache key for
+			// reasoning replay cache operations. The cache key must be
+			// account-independent to support auth failover.
+			c.Set("openai_guard_prompt_cache_key_orig", promptCacheKey)
+		}
 
 		// Update requestView after body modification
 		requestView = newOpenAIRequestView(body)
@@ -2945,6 +2952,22 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		return nil, wsErr
 	}
 
+	// Apply reasoning replay cache: inject cached reasoning items from
+	// previous responses to avoid re-computation round-trips for multi-turn
+	// conversations. This must happen after all body transforms (confuse, clean)
+	// but before building the upstream request.
+	if account != nil && account.Type == AccountTypeOAuth {
+		origPcKey := promptCacheKey
+		if c != nil {
+			if v, ok := c.Get("openai_guard_prompt_cache_key_orig"); ok {
+				if s, ok := v.(string); ok && s != "" {
+					origPcKey = s
+				}
+			}
+		}
+		body = s.applyCodexReasoningReplayCache(originalModel, origPcKey, body)
+	}
+
 	httpInvalidEncryptedContentRetryTried := false
 	for {
 		// Build upstream request
@@ -3007,6 +3030,15 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					}
 					httpInvalidEncryptedContentRetryTried = true
 					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request once after invalid_encrypted_content (account: %s)", account.Name)
+					// Clear the replay cache so invalid reasoning items
+					// from this session are not injected again.
+					origPcKeyForClear := ""
+					if c != nil {
+						if v, ok := c.Get("openai_guard_prompt_cache_key_orig"); ok {
+							origPcKeyForClear, _ = v.(string)
+						}
+					}
+					s.clearCodexReasoningReplayOnInvalidSig(ctx, originalModel, origPcKeyForClear)
 					continue
 				}
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Skip non-WSv2 invalid_encrypted_content retry because encrypted reasoning items are missing (account: %s)", account.Name)
@@ -4257,6 +4289,54 @@ func (s *OpenAIGatewayService) overrideBrowserUserAgent(ctx context.Context, acc
 	req.Header.Set("user-agent", codexUA)
 }
 
+// applyCodexReasoningReplayCache injects cached reasoning replay items from
+// previous responses into the request body before sending upstream. This
+// reduces the number of full-reasoning round-trips and lowers anomaly detection
+// risk for multi-turn conversations.
+func (s *OpenAIGatewayService) applyCodexReasoningReplayCache(originalModel, promptCacheKey string, body []byte) []byte {
+	if originalModel == "" || promptCacheKey == "" || len(body) == 0 {
+		return body
+	}
+	items, ok := cache.GetCodexReasoningReplayItems(originalModel, promptCacheKey)
+	if !ok || len(items) == 0 {
+		return body
+	}
+	items = cache.FilterCodexReasoningReplayItemsForInput(body, items)
+	if len(items) == 0 {
+		return body
+	}
+	updated, ok := cache.InsertCodexReasoningReplayItems(body, items)
+	if !ok {
+		return body
+	}
+	logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Injected %d reasoning replay items for model=%s session=%s", len(items), originalModel, promptCacheKey[:min(16, len(promptCacheKey))])
+	return updated
+}
+
+// cacheCodexReasoningReplayFromCompleted extracts reasoning items from a
+// completed response and caches them for future replay.
+func (s *OpenAIGatewayService) cacheCodexReasoningReplayFromCompleted(originalModel, promptCacheKey string, completedData []byte) {
+	if s == nil || originalModel == "" || promptCacheKey == "" || len(completedData) == 0 {
+		return
+	}
+	items := cache.ExtractCodexReasoningReplayFromCompleted(completedData)
+	if len(items) == 0 {
+		return
+	}
+	cache.CacheCodexReasoningReplayItems(originalModel, promptCacheKey, items)
+}
+
+// clearCodexReasoningReplayOnInvalidSig clears the replay cache when upstream
+// rejects the reasoning signature as invalid, preventing stale replay items
+// from persisting across sessions.
+func (s *OpenAIGatewayService) clearCodexReasoningReplayOnInvalidSig(ctx context.Context, originalModel, promptCacheKey string) {
+	if s == nil || originalModel == "" || promptCacheKey == "" {
+		return
+	}
+	logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Clearing reasoning replay cache for model=%s session=%s due to signature invalidation", originalModel, promptCacheKey[:min(16, len(promptCacheKey))])
+	cache.DeleteCodexReasoningReplayItem(originalModel, promptCacheKey)
+}
+
 // restoreOpenAIConfuseStreamData restores identity-confused values in SSE data
 // before sending to the client. Returns the (possibly modified) data bytes.
 func (s *OpenAIGatewayService) restoreOpenAIConfuseStreamData(c *gin.Context, data []byte) []byte {
@@ -5228,8 +5308,18 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 		if originalModel != mappedModel {
 			body = s.replaceModelInResponseBody(body, mappedModel, originalModel)
 		}
-		// Correct tool calls in final response
+		// Correct tool calls in final response (SSE-to-JSON path)
 		body = s.correctToolCallsInResponseBody(body)
+
+		// Cache reasoning replay items from completed response for
+		// future multi-turn conversations. Must use the original
+		// (pre-confusion) prompt cache key for account independence.
+		// The context value is only set for OAuth accounts by Forward().
+		if v, ok := c.Get("openai_guard_prompt_cache_key_orig"); ok {
+			if pcKey, ok := v.(string); ok && pcKey != "" {
+				s.cacheCodexReasoningReplayFromCompleted(originalModel, pcKey, body)
+			}
+		}
 	} else {
 		terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
 		if terminalOK && terminalType == "response.failed" {
