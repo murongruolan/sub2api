@@ -466,7 +466,7 @@ func ChromeProfile() *Profile {
 		Curves:            chromeCurves,
 		PointFormats:      []uint16{0},
 		SignatureAlgorithms: chromeSignatureAlgorithms,
-		ALPNProtocols:     []string{"h2", "http/1.1"},
+		ALPNProtocols:     []string{"http/1.1"},
 		SupportedVersions: []uint16{0x0304, 0x0303},
 		KeyShareGroups:    []uint16{0x001d, 0x0017}, // X25519, secp256r1
 		PSKModes:          []uint16{1},              // PSK_DHE_KE
