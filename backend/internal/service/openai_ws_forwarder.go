@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/guard"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
@@ -1181,6 +1182,22 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 	if account != nil && account.Type == AccountTypeOAuth && !openai.IsCodexCLIRequest(headers.Get("user-agent")) {
 		headers.Set("user-agent", codexCLIUserAgent)
 	}
+
+	// === [enhanced] Session Header Governance + Identity Confuse ===
+	if account != nil && account.Type == AccountTypeOAuth {
+		guard.ApplySessionGovernance(headers, promptCacheKey)
+
+		// Use confuseState from gin context (set by Forward() after ConfuseBody)
+		// so turn_id mappings are properly tracked for response restoration.
+		var confuseState *guard.ConfuseState
+		if c != nil {
+			if v, ok := c.Get("openai_guard_confuse_state"); ok {
+				confuseState, _ = v.(*guard.ConfuseState)
+			}
+		}
+		guard.ConfuseHeaders(headers, account.ID, confuseState, promptCacheKey)
+	}
+	// === end enhanced ===
 
 	return headers, sessionResolution
 }

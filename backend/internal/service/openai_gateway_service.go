@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/guard"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -2702,6 +2703,28 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		imageInputSize = imageCfg.InputSize
 	}
 
+	// === [enhanced] Identity Confuse + Reasoning Sanitizer ===
+	// Apply anti-detection transforms before sending to upstream.
+	// Only for OAuth accounts (Codex/ChatGPT) where session isolation matters.
+	var openAIConfuseState *guard.ConfuseState
+	if account.Type == AccountTypeOAuth && len(body) > 0 {
+		// Step 1: Proactively sanitize invalid reasoning encrypted_content
+		body = guard.SanitizeReasoning("codex", body)
+
+		// Step 2: Obfuscate session identity fields per account
+		body, openAIConfuseState = guard.ConfuseBody(body, account.ID)
+
+		// Store confuseState in gin context for response restoration
+		if c != nil && openAIConfuseState != nil {
+			c.Set("openai_guard_confuse_state", openAIConfuseState)
+		}
+
+		// Update requestView after body modification
+		requestView = newOpenAIRequestView(body)
+		promptCacheKey = requestView.PromptCacheKey
+	}
+	// === end enhanced ===
+
 	// Get access token
 	token, _, err := s.GetAccessToken(ctx, account)
 	if err != nil {
@@ -4187,6 +4210,26 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 		req.Header.Set("content-type", "application/json")
 	}
 
+	// === [enhanced] Session Header Governance + Identity Confuse Headers ===
+	// Apply header canonicalization and identity obfuscation for OAuth accounts.
+	if account != nil && account.Type == AccountTypeOAuth {
+		// Step 1: Unify session header variants and inject missing Codex headers
+		guard.ApplySessionGovernance(req.Header, promptCacheKey)
+
+		// Step 2: Obfuscate session identity headers using the same account-level key.
+		// Use confuseState from gin context (set by Forward() after ConfuseBody) so
+		// turn_id mappings are properly tracked for response restoration.
+		var confuseState *guard.ConfuseState
+		if c != nil {
+			if v, ok := c.Get("openai_guard_confuse_state"); ok {
+				confuseState, _ = v.(*guard.ConfuseState)
+			}
+		}
+		confusedPcKey := promptCacheKey
+		guard.ConfuseHeaders(req.Header, account.ID, confuseState, confusedPcKey)
+	}
+	// === end enhanced ===
+
 	return req, nil
 }
 
@@ -4212,6 +4255,23 @@ func (s *OpenAIGatewayService) overrideBrowserUserAgent(ctx context.Context, acc
 		}
 	}
 	req.Header.Set("user-agent", codexUA)
+}
+
+// restoreOpenAIConfuseStreamData restores identity-confused values in SSE data
+// before sending to the client. Returns the (possibly modified) data bytes.
+func (s *OpenAIGatewayService) restoreOpenAIConfuseStreamData(c *gin.Context, data []byte) []byte {
+	if c == nil || len(data) == 0 {
+		return data
+	}
+	v, ok := c.Get("openai_guard_confuse_state")
+	if !ok {
+		return data
+	}
+	state, ok := v.(*guard.ConfuseState)
+	if !ok || state == nil {
+		return data
+	}
+	return guard.RestoreResponseRestorer(state)(data)
 }
 
 func (s *OpenAIGatewayService) handleErrorResponse(
@@ -4717,6 +4777,17 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 				line = "data: " + data
 				eventType = strings.TrimSpace(gjson.GetBytes(dataBytes, "type").String())
 			}
+
+			// Restore identity-confused values (prompt_cache_key, turn IDs) before
+			// sending to client so the client sees original values.
+			if account != nil && account.Type == AccountTypeOAuth {
+				if restored := s.restoreOpenAIConfuseStreamData(c, dataBytes); !bytes.Equal(restored, dataBytes) {
+					dataBytes = restored
+					data = string(restored)
+					line = "data: " + data
+				}
+			}
+
 			startsClientOutput := forceFlushFailedEvent || openAIStreamDataStartsClientOutput(data, eventType)
 
 			// 写入客户端（客户端断开后继续 drain 上游）
@@ -5098,6 +5169,16 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	// Replace model in response if needed
 	if originalModel != mappedModel {
 		body = s.replaceModelInResponseBody(body, mappedModel, originalModel)
+	}
+
+	// Restore identity-confused values (prompt_cache_key, turn IDs) before
+	// sending to client so the client sees original values.
+	if account != nil && account.Type == AccountTypeOAuth {
+		if v, ok := c.Get("openai_guard_confuse_state"); ok {
+			if state, ok := v.(*guard.ConfuseState); ok && state != nil {
+				body = guard.RestoreResponseRestorer(state)(body)
+			}
+		}
 	}
 
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)

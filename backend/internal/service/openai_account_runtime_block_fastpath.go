@@ -3,17 +3,47 @@ package service
 import (
 	"context"
 	"net/http"
+	"sync"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/guard"
 )
 
 const (
-	openAIAccountStateUpdateTimeout       = 5 * time.Second
-	openAIOAuth429FallbackCooldown        = 5 * time.Second
-	openAIStopSchedulingBridgeCooldown    = 2 * time.Minute
-	openAIOAuth429StormWindow             = 10 * time.Second
-	openAIOAuth429StormThreshold          = 20
+	openAIAccountStateUpdateTimeout    = 5 * time.Second
+	openAIOAuth429FallbackCooldown     = 5 * time.Second
+	openAIStopSchedulingBridgeCooldown = 2 * time.Minute
+	openAIOAuth429StormWindow          = 10 * time.Second
+	openAIOAuth429StormThreshold       = 20
 	openAIOAuth429StormMaxAccountSwitches = 1
+
+	// openAICFChallengeCooldown is the base cooldown for Cloudflare challenges.
+	// Shorter than 429 cooldowns to allow quick retry with other accounts.
+	openAICFChallengeInitialCooldown = 10 * time.Second
+	openAICFChallengeMaxCooldown     = 120 * time.Second
+	openAICFChallengeBackoffFactor   = 3
 )
+
+// openAICFBackoffLevels tracks progressive backoff levels per account for
+// Cloudflare challenge cooldowns. Level 0 = first challenge, level 1 = second, etc.
+var openAICFBackoffLevels sync.Map
+
+func openAICFBackoffLevel(accountID int64) int {
+	v, ok := openAICFBackoffLevels.Load(accountID)
+	if !ok {
+		return 0
+	}
+	level, _ := v.(int)
+	return level
+}
+
+func setOpenAICFBackoffLevel(accountID int64, level int) {
+	openAICFBackoffLevels.Store(accountID, level)
+}
+
+func resetOpenAICFBackoffLevel(accountID int64) {
+	openAICFBackoffLevels.Delete(accountID)
+}
 
 func openAIAccountStateContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	base := context.Background()
@@ -44,11 +74,44 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 	if len(requestedModel) > 0 && s.rateLimitService.HandleUpstreamModelNotFound(stateCtx, account, requestedModel[0], statusCode, responseBody) {
 		return true
 	}
+
+	// Cloudflare challenge detection with progressive backoff.
+	// Unlike 429/other errors that use a fixed 2-minute cooldown, CF challenges
+	// get an exponentially-increasing backoff (10s, 30s, 90s, 120s max) so the
+	// account can be retried quickly while still avoiding hammering.
+	if guard.IsCloudflareChallengeCode(statusCode, responseBody) {
+		s.markOpenAICloudflareChallenge(stateCtx, account)
+		// Return false: we want the conductor to try another account, not
+		// permanently disable this one after a CF challenge.
+		return false
+	}
+
 	shouldDisable := s.rateLimitService.HandleUpstreamError(stateCtx, account, statusCode, headers, responseBody)
 	if shouldDisable {
 		s.BlockAccountScheduling(account, time.Time{}, "upstream_disable")
 	}
 	return shouldDisable
+}
+
+// markOpenAICloudflareChallenge applies a progressive exponential backoff for
+// Cloudflare challenge responses. The account is temporarily unschedulable but
+// recovers quickly so other accounts can be tried immediately.
+func (s *OpenAIGatewayService) markOpenAICloudflareChallenge(ctx context.Context, account *Account) {
+	if s == nil || !isOpenAIOAuthAccount(account) {
+		return
+	}
+	level := openAICFBackoffLevel(account.ID)
+	cfg := guard.CloudflareBackoffConfig{
+		Enabled:         true,
+		InitialCooldown: openAICFChallengeInitialCooldown,
+		MaxCooldown:     openAICFChallengeMaxCooldown,
+		BackoffFactor:   openAICFChallengeBackoffFactor,
+	}
+	cooldown := guard.CloudflareBackoff(level, &cfg)
+	if cooldown > 0 {
+		setOpenAICFBackoffLevel(account.ID, level+1)
+		s.BlockAccountScheduling(account, time.Now().Add(cooldown), "cloudflare_challenge")
+	}
 }
 
 func (s *OpenAIGatewayService) markOpenAIOAuth429RateLimited(ctx context.Context, account *Account, headers http.Header, responseBody []byte) {
